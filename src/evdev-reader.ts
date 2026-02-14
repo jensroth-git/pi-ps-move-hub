@@ -9,7 +9,10 @@ import {
   EV_KEY,
   EV_ABS,
 } from './types';
-import { BUTTON_MAP, AXIS_MAP, DPAD_AXIS_MAP } from './button-map';
+import {
+  BUTTON_MAP, AXIS_MAP, DPAD_AXIS_MAP,
+  AMBIGUOUS_BTN_SOUTH, BTN_SOUTH_USB, BTN_SOUTH_BT,
+} from './button-map';
 
 // ─── Linux input_event struct ───────────────────────────────────────────────
 // On 64-bit (Raspberry Pi OS 64-bit / aarch64):
@@ -54,6 +57,11 @@ export class EvdevReader extends EventEmitter {
 
   // Track last emitted stick values to suppress redundant deadzone events
   private lastStickValue: Record<string, number> = {};
+
+  // Auto-detected input mode: USB (hid-sony) vs Bluetooth (hid-generic joystick)
+  // USB axes: 0-255 (center 128)   |  BT axes: -127..127 (center 0)
+  // USB buttons: 0x130+ (hid-sony) |  BT buttons: 0x120+ (generic joystick)
+  private inputMode: 'unknown' | 'usb' | 'bluetooth' = 'unknown';
 
   // ─── Stick deadzone ─────────────────────────────────────────────────────
   // Values within [DEADZONE_MIN, DEADZONE_MAX] are clamped to DEADZONE_CENTER.
@@ -155,8 +163,40 @@ export class EvdevReader extends EventEmitter {
     // Skip sync events
     if (raw.type === EV_SYN) return;
 
+    // ── Auto-detect input mode ──
+    // Bluetooth axes range -127..127 (negative values impossible in USB 0..255)
+    // Button codes in 0x121..0x12e are unique to BT; 0x131..0x13d to USB.
+    if (this.inputMode === 'unknown') {
+      if (raw.type === EV_ABS && raw.value < 0) {
+        this.inputMode = 'bluetooth';
+        console.log('[evdev] Auto-detected Bluetooth mode (negative axis value)');
+      } else if (raw.type === EV_ABS && raw.value > 127) {
+        this.inputMode = 'usb';
+        console.log('[evdev] Auto-detected USB mode (axis value > 127)');
+      } else if (raw.type === EV_KEY && raw.code >= 0x121 && raw.code <= 0x12e) {
+        this.inputMode = 'bluetooth';
+        console.log('[evdev] Auto-detected Bluetooth mode (BT-only button code)');
+      } else if (raw.type === EV_KEY && raw.code >= 0x131 && raw.code <= 0x13d) {
+        this.inputMode = 'usb';
+        console.log('[evdev] Auto-detected USB mode (USB-only button code)');
+      }
+    }
+
     // ── Button events ──
     if (raw.type === EV_KEY) {
+      // Handle the ambiguous BTN_SOUTH (0x130): Cross in USB, PS in Bluetooth
+      if (raw.code === AMBIGUOUS_BTN_SOUTH) {
+        const button = this.inputMode === 'usb' ? BTN_SOUTH_USB : BTN_SOUTH_BT;
+        const evt: PSNavButtonEvent = {
+          kind: 'button',
+          button,
+          pressed: raw.value !== 0,
+          timestamp: now,
+        };
+        this.emit('nav', evt);
+        return;
+      }
+
       const buttonMap = BUTTON_MAP[EV_KEY];
       if (buttonMap && raw.code in buttonMap) {
         const evt: PSNavButtonEvent = {
@@ -172,7 +212,7 @@ export class EvdevReader extends EventEmitter {
 
     // ── Axis events ──
     if (raw.type === EV_ABS) {
-      // Check D-pad hat axes first
+      // Check D-pad hat axes first (USB/hid-sony only)
       if (raw.code in DPAD_AXIS_MAP) {
         this.handleDpadAxis(raw, now);
         return;
@@ -182,11 +222,20 @@ export class EvdevReader extends EventEmitter {
       if (axisMap && raw.code in axisMap) {
         const axis = axisMap[raw.code];
 
+        // Normalize axis value to 0-255 range
+        // USB / hid-sony:  0..255 (center 128)  — no conversion needed
+        // BT / hid-generic: -127..127 (center 0) — normalize to 0..255
+        let value = raw.value;
+        if (this.inputMode === 'bluetooth') {
+          value = Math.round(((value + 127) / 254) * 255);
+        }
+        value = Math.max(0, Math.min(255, value));
+
         // Apply deadzone: clamp values in [118, 138] to 128
         const clamped =
-          (raw.value >= EvdevReader.DEADZONE_MIN && raw.value <= EvdevReader.DEADZONE_MAX)
+          (value >= EvdevReader.DEADZONE_MIN && value <= EvdevReader.DEADZONE_MAX)
             ? EvdevReader.DEADZONE_CENTER
-            : raw.value;
+            : value;
 
         // Only emit when the clamped value actually changes
         if (this.lastStickValue[axis] === clamped) return;

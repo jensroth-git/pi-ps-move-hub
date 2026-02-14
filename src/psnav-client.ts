@@ -7,10 +7,14 @@
  * Usage:
  *   import { PSNavClient } from './psnav-client';
  *
- *   const nav = new PSNavClient('http://192.168.1.50:3050');
+ *   const nav = new PSNavClient('http://192.168.1.50:3050', {
+ *     serviceName: 'my-cool-app',   // register as a named service
+ *   });
  *
  *   nav.on('button', (evt) => console.log(evt.button, evt.pressed));
  *   nav.on('axis',   (evt) => console.log(evt.axis, evt.value));
+ *   nav.on('activated',   () => console.log('I am now the active client!'));
+ *   nav.on('deactivated', () => console.log('No longer active'));
  *
  *   nav.connect();
  */
@@ -60,13 +64,27 @@ export interface RawInputEvent {
   value: number;
 }
 
+export interface RegisteredClient {
+  socketId: string;
+  serviceName: string;
+  registeredAt: number;
+}
+
+export interface ClientListInfo {
+  clients: RegisteredClient[];
+  activeIndex: number;
+  activeServiceName: string | null;
+}
+
 // ─── Callback types ─────────────────────────────────────────────────────────
 
-type ButtonCallback = (event: PSNavButtonEvent) => void;
-type AxisCallback   = (event: PSNavAxisEvent) => void;
-type RawCallback    = (event: RawInputEvent) => void;
-type DeviceCallback = (info: { device: string; reason?: string }) => void;
-type VoidCallback   = () => void;
+type ButtonCallback      = (event: PSNavButtonEvent) => void;
+type AxisCallback        = (event: PSNavAxisEvent) => void;
+type RawCallback         = (event: RawInputEvent) => void;
+type DeviceCallback      = (info: { device: string; reason?: string }) => void;
+type ServiceCallback     = (info: { serviceName: string }) => void;
+type ClientListCallback  = (info: ClientListInfo) => void;
+type VoidCallback        = () => void;
 
 interface CallbackMap {
   button:       Set<ButtonCallback>;
@@ -74,6 +92,9 @@ interface CallbackMap {
   raw:          Set<RawCallback>;
   connected:    Set<DeviceCallback>;
   disconnected: Set<DeviceCallback>;
+  activated:    Set<ServiceCallback>;
+  deactivated:  Set<ServiceCallback>;
+  clientList:   Set<ClientListCallback>;
   open:         Set<VoidCallback>;
   close:        Set<VoidCallback>;
 }
@@ -84,6 +105,8 @@ type CallbackFor<E extends EventName> = CallbackMap[E] extends Set<infer T> ? T 
 // ─── Client options ─────────────────────────────────────────────────────────
 
 export interface PSNavClientOptions {
+  /** Register as a named service to receive nav events (required for input) */
+  serviceName?: string;
   /** Subscribe to raw evdev events (default: false) */
   raw?: boolean;
   /** Auto-reconnect on disconnect (default: true) */
@@ -96,7 +119,7 @@ export interface PSNavClientOptions {
 
 export class PSNavClient {
   private url: string;
-  private opts: Required<Pick<PSNavClientOptions, 'raw' | 'reconnect'>> & Pick<PSNavClientOptions, 'socketOpts'>;
+  private opts: Required<Pick<PSNavClientOptions, 'raw' | 'reconnect'>> & Pick<PSNavClientOptions, 'serviceName' | 'socketOpts'>;
   private socket: Socket | null = null;
 
   private callbacks: CallbackMap = {
@@ -105,6 +128,9 @@ export class PSNavClient {
     raw:          new Set(),
     connected:    new Set(),
     disconnected: new Set(),
+    activated:    new Set(),
+    deactivated:  new Set(),
+    clientList:   new Set(),
     open:         new Set(),
     close:        new Set(),
   };
@@ -125,9 +151,16 @@ export class PSNavClient {
     l2_analog: 0,
   };
 
+  /** Whether this client is currently the active service receiving nav events */
+  public isActive = false;
+
+  /** Latest client list from the server */
+  public clientList: ClientListInfo = { clients: [], activeIndex: -1, activeServiceName: null };
+
   constructor(url: string, opts: PSNavClientOptions = {}) {
     this.url = url;
     this.opts = {
+      serviceName: opts.serviceName,
       raw: opts.raw ?? false,
       reconnect: opts.reconnect ?? true,
       socketOpts: opts.socketOpts,
@@ -146,6 +179,10 @@ export class PSNavClient {
     });
 
     this.socket.on('connect', () => {
+      // Register as a named service if configured
+      if (this.opts.serviceName) {
+        this.socket!.emit('register', this.opts.serviceName);
+      }
       if (this.opts.raw) {
         this.socket!.emit('subscribe:raw', true);
       }
@@ -153,10 +190,11 @@ export class PSNavClient {
     });
 
     this.socket.on('disconnect', () => {
+      this.isActive = false;
       this.fire('close');
     });
 
-    // ── Server events ──
+    // ── Nav events ──
 
     this.socket.on('nav:button', (evt: PSNavButtonEvent) => {
       this.buttons[evt.button] = evt.pressed;
@@ -172,12 +210,31 @@ export class PSNavClient {
       this.fire('raw', evt);
     });
 
+    // ── Device lifecycle ──
+
     this.socket.on('nav:connected', (info: { device: string }) => {
       this.fire('connected', info);
     });
 
     this.socket.on('nav:disconnected', (info: { device: string; reason: string }) => {
       this.fire('disconnected', info);
+    });
+
+    // ── Service manager events ──
+
+    this.socket.on('client:activated', (info: { serviceName: string }) => {
+      this.isActive = true;
+      this.fire('activated', info);
+    });
+
+    this.socket.on('client:deactivated', (info: { serviceName: string }) => {
+      this.isActive = false;
+      this.fire('deactivated', info);
+    });
+
+    this.socket.on('client:list', (info: ClientListInfo) => {
+      this.clientList = info;
+      this.fire('clientList', info);
     });
   }
 

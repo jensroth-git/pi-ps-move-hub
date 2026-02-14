@@ -1,6 +1,6 @@
 import express from 'express';
 import { createServer } from 'http';
-import { Server } from 'socket.io';
+import { Server, Socket } from 'socket.io';
 import { EvdevReader } from './evdev-reader';
 import type {
   ServerToClientEvents,
@@ -10,6 +10,8 @@ import type {
   PSNavButtonEvent,
   PSNavAxisEvent,
   RawInputEvent,
+  RegisteredClient,
+  ClientListInfo,
 } from './types';
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -36,6 +38,139 @@ const io = new Server<
   },
 });
 
+// ─── Service Manager ────────────────────────────────────────────────────────
+
+type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>;
+
+const registeredClients: RegisteredClient[] = [];
+let activeIndex = -1;
+
+function getClientListInfo(): ClientListInfo {
+  return {
+    clients: [...registeredClients],
+    activeIndex,
+    activeServiceName: activeIndex >= 0 ? registeredClients[activeIndex].serviceName : null,
+  };
+}
+
+function broadcastClientList(): void {
+  io.emit('client:list', getClientListInfo());
+}
+
+function getActiveSocket(): TypedSocket | null {
+  if (activeIndex < 0 || activeIndex >= registeredClients.length) return null;
+  const entry = registeredClients[activeIndex];
+  return io.sockets.sockets.get(entry.socketId) as TypedSocket | undefined ?? null;
+}
+
+/** Get all connected sockets that never called register (always-on observers) */
+function getUnregisteredSockets(): TypedSocket[] {
+  const result: TypedSocket[] = [];
+  for (const [, socket] of io.sockets.sockets) {
+    if (!socket.data.serviceName) {
+      result.push(socket as TypedSocket);
+    }
+  }
+  return result;
+}
+
+/**
+ * Emit a nav event to: the active registered client + all unregistered clients.
+ * Unregistered clients are "always-on" — they receive events regardless of who
+ * is currently active in the service rotation.
+ */
+function emitNavEvent(event: 'nav:button', data: PSNavButtonEvent): void;
+function emitNavEvent(event: 'nav:axis', data: PSNavAxisEvent): void;
+function emitNavEvent(event: 'nav:button' | 'nav:axis', data: PSNavButtonEvent | PSNavAxisEvent): void {
+  // Active registered client
+  const active = getActiveSocket();
+  if (active) active.emit(event as any, data as any);
+
+  // All unregistered (always-on) clients
+  for (const socket of getUnregisteredSockets()) {
+    socket.emit(event as any, data as any);
+  }
+}
+
+function registerClient(socket: TypedSocket, serviceName: string): void {
+  // Prevent double registration — update name if already registered
+  const existing = registeredClients.findIndex((c) => c.socketId === socket.id);
+  if (existing >= 0) {
+    registeredClients[existing].serviceName = serviceName;
+    console.log(`[svc] Updated registration: "${serviceName}" (${socket.id})`);
+  } else {
+    registeredClients.push({
+      socketId: socket.id,
+      serviceName,
+      registeredAt: Date.now(),
+    });
+    console.log(`[svc] Registered: "${serviceName}" (${socket.id}) — ${registeredClients.length} service(s)`);
+  }
+
+  socket.data.serviceName = serviceName;
+
+  // If this is the first client, auto-activate it
+  if (registeredClients.length === 1) {
+    activeIndex = 0;
+    socket.emit('client:activated', { serviceName });
+    console.log(`[svc] Auto-activated: "${serviceName}"`);
+  }
+
+  broadcastClientList();
+}
+
+function unregisterClient(socketId: string): void {
+  const idx = registeredClients.findIndex((c) => c.socketId === socketId);
+  if (idx < 0) return;
+
+  const removed = registeredClients[idx];
+  registeredClients.splice(idx, 1);
+  console.log(`[svc] Unregistered: "${removed.serviceName}" (${socketId}) — ${registeredClients.length} service(s)`);
+
+  // Adjust activeIndex after removal
+  if (registeredClients.length === 0) {
+    activeIndex = -1;
+  } else if (idx === activeIndex) {
+    // The active client left — activate the next (wrap around)
+    activeIndex = activeIndex % registeredClients.length;
+    const next = getActiveSocket();
+    if (next) {
+      const name = registeredClients[activeIndex].serviceName;
+      next.emit('client:activated', { serviceName: name });
+      console.log(`[svc] Active client left, switched to: "${name}"`);
+    }
+  } else if (idx < activeIndex) {
+    // Someone before the active was removed — shift index back
+    activeIndex--;
+  }
+
+  broadcastClientList();
+}
+
+function cycleActiveClient(): void {
+  if (registeredClients.length === 0) return;
+
+  // Deactivate current
+  const prevSocket = getActiveSocket();
+  if (prevSocket && activeIndex >= 0) {
+    const prevName = registeredClients[activeIndex].serviceName;
+    prevSocket.emit('client:deactivated', { serviceName: prevName });
+  }
+
+  // Advance to next
+  activeIndex = (activeIndex + 1) % registeredClients.length;
+
+  // Activate new
+  const nextSocket = getActiveSocket();
+  if (nextSocket) {
+    const nextName = registeredClients[activeIndex].serviceName;
+    nextSocket.emit('client:activated', { serviceName: nextName });
+    console.log(`[svc] Switched active client → "${nextName}"`);
+  }
+
+  broadcastClientList();
+}
+
 // ─── Health / status endpoint ───────────────────────────────────────────────
 
 let connectedClients = 0;
@@ -48,6 +183,7 @@ app.get('/', (_req, res) => {
     device: DEVICE_PATH,
     deviceConnected,
     clients: connectedClients,
+    services: getClientListInfo(),
     uptime: process.uptime(),
   });
 });
@@ -57,6 +193,7 @@ app.get('/', (_req, res) => {
 io.on('connection', (socket) => {
   connectedClients++;
   socket.data.wantsRaw = false;
+  socket.data.serviceName = null;
 
   console.log(`[io] Client connected: ${socket.id} (${connectedClients} total)`);
 
@@ -64,6 +201,14 @@ io.on('connection', (socket) => {
   if (deviceConnected) {
     socket.emit('nav:connected', { device: DEVICE_PATH });
   }
+
+  // Send current service list so the client knows the state
+  socket.emit('client:list', getClientListInfo());
+
+  // ── Register as a named service ──
+  socket.on('register', (serviceName) => {
+    registerClient(socket, serviceName);
+  });
 
   // Client can opt-in to raw events
   socket.on('subscribe:raw', (enabled) => {
@@ -73,6 +218,7 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', (reason) => {
     connectedClients--;
+    unregisterClient(socket.id);
     console.log(`[io] Client disconnected: ${socket.id} (${reason}) — ${connectedClients} remaining`);
   });
 });
@@ -89,16 +235,28 @@ function startEvdevReader(): void {
   });
 
   reader.on('nav', (event) => {
+    // ── PS button: cycle active client (consume, don't forward) ──
+    if (event.kind === 'button' && event.button === 'ps' && event.pressed) {
+      cycleActiveClient();
+      return;
+    }
+
+    // ── Forward to active registered client + all unregistered (always-on) clients ──
     if (event.kind === 'button') {
-      io.emit('nav:button', event as PSNavButtonEvent);
+      emitNavEvent('nav:button', event as PSNavButtonEvent);
     } else if (event.kind === 'axis') {
-      io.emit('nav:axis', event as PSNavAxisEvent);
+      emitNavEvent('nav:axis', event as PSNavAxisEvent);
     }
   });
 
   reader.on('raw', (raw: RawInputEvent) => {
-    // Only send to clients that opted in
-    for (const [, socket] of io.sockets.sockets) {
+    // Active registered client
+    const active = getActiveSocket();
+    if (active?.data.wantsRaw) {
+      active.emit('nav:raw', raw);
+    }
+    // Unregistered always-on clients
+    for (const socket of getUnregisteredSockets()) {
       if (socket.data.wantsRaw) {
         socket.emit('nav:raw', raw);
       }
@@ -129,27 +287,17 @@ function startMockInput(): void {
   deviceConnected = true;
   io.emit('nav:connected', { device: 'mock' });
 
-  // Simulate stick movement
+  // Simulate stick movement → active registered + all unregistered
   setInterval(() => {
     const now = Date.now();
     const x = Math.round(128 + 127 * Math.sin(now / 1000));
     const y = Math.round(128 + 127 * Math.cos(now / 1000));
 
-    io.emit('nav:axis', {
-      kind: 'axis',
-      axis: 'stick_x',
-      value: x,
-      timestamp: now,
-    });
-    io.emit('nav:axis', {
-      kind: 'axis',
-      axis: 'stick_y',
-      value: y,
-      timestamp: now,
-    });
+    emitNavEvent('nav:axis', { kind: 'axis', axis: 'stick_x', value: x, timestamp: now });
+    emitNavEvent('nav:axis', { kind: 'axis', axis: 'stick_y', value: y, timestamp: now });
   }, 50);
 
-  // Simulate random button presses
+  // Simulate random button presses → active registered + all unregistered
   const buttons: Array<PSNavButtonEvent['button']> = [
     'cross', 'circle', 'l1', 'l2', 'dpad_up', 'dpad_down', 'dpad_left', 'dpad_right',
   ];
@@ -157,13 +305,17 @@ function startMockInput(): void {
     const btn = buttons[Math.floor(Math.random() * buttons.length)];
     const now = Date.now();
 
-    io.emit('nav:button', { kind: 'button', button: btn, pressed: true, timestamp: now });
-
-    // Release after 100ms
+    emitNavEvent('nav:button', { kind: 'button', button: btn, pressed: true, timestamp: now });
     setTimeout(() => {
-      io.emit('nav:button', { kind: 'button', button: btn, pressed: false, timestamp: Date.now() });
+      emitNavEvent('nav:button', { kind: 'button', button: btn, pressed: false, timestamp: Date.now() });
     }, 100);
   }, 2000);
+
+  // Simulate PS button press every 8s → cycles active registered client
+  setInterval(() => {
+    console.log('[mock] Simulating PS button → cycling active client');
+    cycleActiveClient();
+  }, 8000);
 }
 
 // ─── Start ──────────────────────────────────────────────────────────────────

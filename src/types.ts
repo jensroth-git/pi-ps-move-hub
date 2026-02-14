@@ -50,6 +50,20 @@ export interface PSNavAxisEvent {
 
 export type PSNavEvent = PSNavButtonEvent | PSNavAxisEvent;
 
+// ─── Service manager types ──────────────────────────────────────────────────
+
+export interface RegisteredClient {
+  socketId: string;
+  serviceName: string;
+  registeredAt: number;
+}
+
+export interface ClientListInfo {
+  clients: RegisteredClient[];
+  activeIndex: number;           // -1 if none active
+  activeServiceName: string | null;
+}
+
 // ─── Socket.IO event map ────────────────────────────────────────────────────
 
 export interface ServerToClientEvents {
@@ -58,14 +72,24 @@ export interface ServerToClientEvents {
   'nav:raw': (event: RawInputEvent) => void;
   'nav:connected': (info: { device: string }) => void;
   'nav:disconnected': (info: { device: string; reason: string }) => void;
+
+  /** Sent to the newly active client */
+  'client:activated': (info: { serviceName: string }) => void;
+  /** Sent to the previously active client */
+  'client:deactivated': (info: { serviceName: string }) => void;
+  /** Broadcast to all clients when the client list or active client changes */
+  'client:list': (info: ClientListInfo) => void;
 }
 
 export interface ClientToServerEvents {
   'subscribe:raw': (enabled: boolean) => void;
+  /** Register this socket as a named service */
+  'register': (serviceName: string) => void;
 }
 
 export interface InterServerEvents {}
 
 export interface SocketData {
   wantsRaw: boolean;
+  serviceName: string | null;
 }

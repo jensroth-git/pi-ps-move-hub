@@ -1,5 +1,5 @@
 {
-  "name": "psmovehub",
+  "name": "pi-ps-move-hub",
   "version": "1.0.0",
   "description": "PS Navigation Controller Socket.IO server for Raspberry Pi 5",
   "main": "dist/server.js",
