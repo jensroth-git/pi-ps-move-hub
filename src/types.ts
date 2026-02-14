@@ -50,6 +50,15 @@ export interface PSNavAxisEvent {
 
 export type PSNavEvent = PSNavButtonEvent | PSNavAxisEvent;
 
+// ─── Battery status ─────────────────────────────────────────────────────────
+
+export interface BatteryStatus {
+  level: number | null;      // 0-100 percentage, null if unavailable
+  charging: boolean | null;  // true if charging, null if unknown
+  source: string | null;     // sysfs power_supply name that was read
+  timestamp: number;         // ms since epoch
+}
+
 // ─── Service manager types ──────────────────────────────────────────────────
 
 export interface RegisteredClient {
@@ -79,12 +88,17 @@ export interface ServerToClientEvents {
   'client:deactivated': (info: { serviceName: string }) => void;
   /** Broadcast to all clients when the client list or active client changes */
   'client:list': (info: ClientListInfo) => void;
+
+  /** Response to battery:request */
+  'battery:status': (status: BatteryStatus) => void;
 }
 
 export interface ClientToServerEvents {
   'subscribe:raw': (enabled: boolean) => void;
   /** Register this socket as a named service */
   'register': (serviceName: string) => void;
+  /** Request current battery status */
+  'battery:request': () => void;
 }
 
 export interface InterServerEvents {}

@@ -76,6 +76,13 @@ export interface ClientListInfo {
   activeServiceName: string | null;
 }
 
+export interface BatteryStatus {
+  level: number | null;      // 0-100 percentage, null if unavailable
+  charging: boolean | null;  // true if charging, null if unknown
+  source: string | null;     // sysfs power_supply name that was read
+  timestamp: number;         // ms since epoch
+}
+
 // ─── Callback types ─────────────────────────────────────────────────────────
 
 type ButtonCallback      = (event: PSNavButtonEvent) => void;
@@ -84,6 +91,7 @@ type RawCallback         = (event: RawInputEvent) => void;
 type DeviceCallback      = (info: { device: string; reason?: string }) => void;
 type ServiceCallback     = (info: { serviceName: string }) => void;
 type ClientListCallback  = (info: ClientListInfo) => void;
+type BatteryCallback     = (status: BatteryStatus) => void;
 type VoidCallback        = () => void;
 
 interface CallbackMap {
@@ -95,6 +103,7 @@ interface CallbackMap {
   activated:    Set<ServiceCallback>;
   deactivated:  Set<ServiceCallback>;
   clientList:   Set<ClientListCallback>;
+  battery:      Set<BatteryCallback>;
   open:         Set<VoidCallback>;
   close:        Set<VoidCallback>;
 }
@@ -131,6 +140,7 @@ export class PSNavClient {
     activated:    new Set(),
     deactivated:  new Set(),
     clientList:   new Set(),
+    battery:      new Set(),
     open:         new Set(),
     close:        new Set(),
   };
@@ -156,6 +166,9 @@ export class PSNavClient {
 
   /** Latest client list from the server */
   public clientList: ClientListInfo = { clients: [], activeIndex: -1, activeServiceName: null };
+
+  /** Latest battery status (updated after requestBattery()) */
+  public battery: BatteryStatus = { level: null, charging: null, source: null, timestamp: 0 };
 
   constructor(url: string, opts: PSNavClientOptions = {}) {
     this.url = url;
@@ -236,6 +249,13 @@ export class PSNavClient {
       this.clientList = info;
       this.fire('clientList', info);
     });
+
+    // ── Battery status ──
+
+    this.socket.on('battery:status', (status: BatteryStatus) => {
+      this.battery = status;
+      this.fire('battery', status);
+    });
   }
 
   /** Disconnect from the server */
@@ -248,6 +268,12 @@ export class PSNavClient {
   /** True when socket is connected */
   get isConnected(): boolean {
     return this.socket?.connected ?? false;
+  }
+
+  /** Request battery status from the server (response arrives via 'battery' event) */
+  requestBattery(): void {
+    if (!this.socket?.connected) return;
+    this.socket.emit('battery:request');
   }
 
   // ─── Event subscription ─────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { EvdevReader } from './evdev-reader';
 import type {
   ServerToClientEvents,
@@ -12,12 +14,13 @@ import type {
   RawInputEvent,
   RegisteredClient,
   ClientListInfo,
+  BatteryStatus,
 } from './types';
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PORT ?? '3050', 10);
-const DEVICE_PATH = process.env.DEVICE_PATH ?? '/dev/input/event5';
+const DEVICE_PATH_FALLBACK = process.env.DEVICE_PATH ?? '/dev/input/event5';
 const IS_32BIT = process.env.IS_32BIT === '1';
 const MOCK_INPUT = process.env.MOCK_INPUT === '1';
 
@@ -171,17 +174,95 @@ function cycleActiveClient(): void {
   broadcastClientList();
 }
 
+// ─── Battery status (sysfs) ─────────────────────────────────────────────────
+
+const POWER_SUPPLY_PATH = '/sys/class/power_supply';
+
+/**
+ * Read battery percentage from the Linux power_supply sysfs interface.
+ * When a PS3 controller is connected via Bluetooth with hid-sony, the kernel
+ * creates an entry like `sony_controller_battery_XX:XX:XX:XX:XX:XX`.
+ */
+async function getBatteryStatus(): Promise<BatteryStatus> {
+  const fail: BatteryStatus = { level: null, charging: null, source: null, timestamp: Date.now() };
+
+  let entries: string[];
+  try {
+    entries = await fs.readdir(POWER_SUPPLY_PATH);
+  } catch {
+    return fail;
+  }
+
+  // Find a power_supply entry that looks like a game controller battery
+  const batteryEntry = entries.find((e) => {
+    const lower = e.toLowerCase();
+    return lower.includes('sony') || lower.includes('controller') || lower.includes('playstation');
+  });
+
+  if (!batteryEntry) return fail;
+
+  const basePath = path.join(POWER_SUPPLY_PATH, batteryEntry);
+
+  let level: number | null = null;
+  try {
+    const raw = await fs.readFile(path.join(basePath, 'capacity'), 'utf-8');
+    const parsed = parseInt(raw.trim(), 10);
+    if (!isNaN(parsed)) level = parsed;
+  } catch { /* capacity file not available */ }
+
+  let charging: boolean | null = null;
+  try {
+    const raw = await fs.readFile(path.join(basePath, 'status'), 'utf-8');
+    const status = raw.trim().toLowerCase();
+    charging = status === 'charging' || status === 'full';
+  } catch { /* status file not available */ }
+
+  return { level, charging, source: batteryEntry, timestamp: Date.now() };
+}
+
+// ─── Controller device auto-discovery ────────────────────────────────────────
+
+const INPUT_SYSFS = '/sys/class/input';
+
+/**
+ * Scan /sys/class/input/eventX/device/name for a PlayStation controller.
+ * Returns the /dev/input/eventX path if found, otherwise null.
+ * This is called on every (re)connect so we always find the right device
+ * even if the event number changed after a Bluetooth disconnect/reconnect.
+ */
+async function findControllerDevice(): Promise<string | null> {
+  try {
+    const entries = await fs.readdir(INPUT_SYSFS);
+    for (const entry of entries) {
+      if (!entry.startsWith('event')) continue;
+      try {
+        const name = await fs.readFile(
+          path.join(INPUT_SYSFS, entry, 'device', 'name'),
+          'utf-8',
+        );
+        if (name.toLowerCase().includes('playstation')) {
+          return `/dev/input/${entry}`;
+        }
+      } catch { /* entry has no name file — skip */ }
+    }
+  } catch { /* sysfs not available */ }
+  return null;
+}
+
 // ─── Health / status endpoint ───────────────────────────────────────────────
 
 let connectedClients = 0;
 let deviceConnected = false;
+let currentDevicePath = DEVICE_PATH_FALLBACK;
 
-app.get('/', (_req, res) => {
+app.get('/', async (_req, res) => {
+  const battery = await getBatteryStatus();
   res.json({
     name: 'psmovehub',
     status: 'running',
-    device: DEVICE_PATH,
+    device: currentDevicePath,
     deviceConnected,
+    battery,
     clients: connectedClients,
     services: getClientListInfo(),
     uptime: process.uptime(),
@@ -199,7 +280,7 @@ io.on('connection', (socket) => {
 
   // Let client know current device status
   if (deviceConnected) {
-    socket.emit('nav:connected', { device: DEVICE_PATH });
+    socket.emit('nav:connected', { device: currentDevicePath });
   }
 
   // Send current service list so the client knows the state
@@ -216,6 +297,12 @@ io.on('connection', (socket) => {
     console.log(`[io] ${socket.id} raw events: ${enabled}`);
   });
 
+  // Battery status on request
+  socket.on('battery:request', async () => {
+    const status = await getBatteryStatus();
+    socket.emit('battery:status', status);
+  });
+
   socket.on('disconnect', (reason) => {
     connectedClients--;
     unregisterClient(socket.id);
@@ -225,13 +312,24 @@ io.on('connection', (socket) => {
 
 // ─── Evdev reader ───────────────────────────────────────────────────────────
 
-function startEvdevReader(): void {
-  const reader = new EvdevReader({ devicePath: DEVICE_PATH, is32bit: IS_32BIT });
+async function startEvdevReader(): Promise<void> {
+  // Auto-discover the controller device, fall back to configured path
+  const discovered = await findControllerDevice();
+  const devicePath = discovered ?? DEVICE_PATH_FALLBACK;
+  currentDevicePath = devicePath;
+
+  if (discovered) {
+    console.log(`[evdev] Auto-discovered controller at: ${discovered}`);
+  } else {
+    console.log(`[evdev] No controller found via sysfs, falling back to: ${DEVICE_PATH_FALLBACK}`);
+  }
+
+  const reader = new EvdevReader({ devicePath, is32bit: IS_32BIT });
 
   reader.on('open', () => {
     deviceConnected = true;
-    io.emit('nav:connected', { device: DEVICE_PATH });
-    console.log(`[evdev] Device connected: ${DEVICE_PATH}`);
+    io.emit('nav:connected', { device: devicePath });
+    console.log(`[evdev] Device connected: ${devicePath}`);
   });
 
   reader.on('nav', (event) => {
@@ -269,10 +367,10 @@ function startEvdevReader(): void {
 
   reader.on('close', (reason) => {
     deviceConnected = false;
-    io.emit('nav:disconnected', { device: DEVICE_PATH, reason });
+    io.emit('nav:disconnected', { device: devicePath, reason });
     console.log(`[evdev] Device closed: ${reason}`);
 
-    // Auto-reconnect after 3 seconds
+    // Auto-reconnect after 3 seconds — re-discovers the device path
     console.log('[evdev] Reconnecting in 3s...');
     setTimeout(() => startEvdevReader(), 3000);
   });
@@ -324,7 +422,8 @@ httpServer.listen(PORT, () => {
   console.log(`\n  ┌──────────────────────────────────────────┐`);
   console.log(`  │  psmovehub — PS Navigation Socket.IO     │`);
   console.log(`  │  Server running on http://0.0.0.0:${PORT}  │`);
-  console.log(`  │  Device: ${DEVICE_PATH.padEnd(30)}│`);
+  console.log(`  │  Fallback: ${DEVICE_PATH_FALLBACK.padEnd(28)}│`);
+  console.log(`  │  Discovery: auto (sysfs)                 │`);
   console.log(`  │  Mode: ${(MOCK_INPUT ? 'MOCK' : 'LIVE').padEnd(32)}│`);
   console.log(`  └──────────────────────────────────────────┘\n`);
 
