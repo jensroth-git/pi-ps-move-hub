@@ -92,6 +92,7 @@ type DeviceCallback      = (info: { device: string; reason?: string }) => void;
 type ServiceCallback     = (info: { serviceName: string }) => void;
 type ClientListCallback  = (info: ClientListInfo) => void;
 type BatteryCallback     = (status: BatteryStatus) => void;
+type ErrorCallback       = (err: Error) => void;
 type VoidCallback        = () => void;
 
 interface CallbackMap {
@@ -104,6 +105,7 @@ interface CallbackMap {
   deactivated:  Set<ServiceCallback>;
   clientList:   Set<ClientListCallback>;
   battery:      Set<BatteryCallback>;
+  error:        Set<ErrorCallback>;
   open:         Set<VoidCallback>;
   close:        Set<VoidCallback>;
 }
@@ -141,6 +143,7 @@ export class PSNavClient {
     deactivated:  new Set(),
     clientList:   new Set(),
     battery:      new Set(),
+    error:        new Set(),
     open:         new Set(),
     close:        new Set(),
   };
@@ -192,6 +195,7 @@ export class PSNavClient {
     });
 
     this.socket.on('connect', () => {
+      console.log('[psnav] connected to', this.url);
       // Register as a named service if configured
       if (this.opts.serviceName) {
         this.socket!.emit('register', this.opts.serviceName);
@@ -202,9 +206,40 @@ export class PSNavClient {
       this.fire('open');
     });
 
-    this.socket.on('disconnect', () => {
+    this.socket.on('disconnect', (reason) => {
+      console.log(`[psnav] disconnected (reason: ${reason})`);
       this.isActive = false;
       this.fire('close');
+
+      // "io server disconnect" means the server kicked us (e.g. pm2 reload).
+      // socket.io will NOT auto-reconnect in this case, so we do it manually.
+      if (reason === 'io server disconnect' && this.opts.reconnect) {
+        console.log('[psnav] server-initiated disconnect — reconnecting...');
+        this.socket?.connect();
+      }
+    });
+
+    this.socket.on('connect_error', (err) => {
+      console.error('[psnav] connection error:', err.message);
+      this.fire('error', err);
+    });
+
+    // ── Manager-level reconnection lifecycle ──
+
+    this.socket.io.on('reconnect_attempt', (attempt) => {
+      console.log(`[psnav] reconnect attempt #${attempt}...`);
+    });
+
+    this.socket.io.on('reconnect', (attempt) => {
+      console.log(`[psnav] reconnected after ${attempt} attempt(s)`);
+    });
+
+    this.socket.io.on('reconnect_error', (err) => {
+      console.error('[psnav] reconnect error:', err.message);
+    });
+
+    this.socket.io.on('reconnect_failed', () => {
+      console.error('[psnav] all reconnect attempts exhausted');
     });
 
     // ── Nav events ──
