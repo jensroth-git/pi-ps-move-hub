@@ -82,10 +82,12 @@ export class EvdevReader extends EventEmitter {
     try {
       this.fd = fs.openSync(this.devicePath, 'r');
     } catch (err) {
+      const msg = `Cannot open ${this.devicePath}: ${(err as Error).message}`;
       this.emit('error', new Error(
-        `Cannot open ${this.devicePath}: ${(err as Error).message}. ` +
-        `Make sure the device exists and you have read permissions (try running with sudo).`
+        `${msg}. Make sure the device exists and you have read permissions (try running with sudo).`
       ));
+      // Emit 'close' so the server's reconnect chain keeps retrying
+      this.emit('close', msg);
       return;
     }
 
@@ -115,10 +117,15 @@ export class EvdevReader extends EventEmitter {
     fs.read(this.fd, this.buf, 0, this.eventSize, null, (err, bytesRead) => {
       if (err) {
         if (this.reading) {
+          this.reading = false;
+          // Close the fd to prevent leak
+          if (this.fd !== null) {
+            try { fs.closeSync(this.fd); } catch { /* ignore */ }
+            this.fd = null;
+          }
           this.emit('error', err);
           this.emit('close', err.message);
         }
-        this.reading = false;
         return;
       }
 

@@ -312,21 +312,32 @@ io.on('connection', (socket) => {
 
 // ─── Evdev reader ───────────────────────────────────────────────────────────
 
+const RECONNECT_INTERVAL_MS = 3000;
+const MAX_RECONNECT_LOG_INTERVAL = 10;   // after this many attempts, log once per N
+
+let reconnectAttempt = 0;
+
 async function startEvdevReader(): Promise<void> {
   // Auto-discover the controller device, fall back to configured path
   const discovered = await findControllerDevice();
   const devicePath = discovered ?? DEVICE_PATH_FALLBACK;
   currentDevicePath = devicePath;
 
+  const isRetry = reconnectAttempt > 0;
+
   if (discovered) {
     console.log(`[evdev] Auto-discovered controller at: ${discovered}`);
-  } else {
+  } else if (!isRetry) {
     console.log(`[evdev] No controller found via sysfs, falling back to: ${DEVICE_PATH_FALLBACK}`);
   }
 
   const reader = new EvdevReader({ devicePath, is32bit: IS_32BIT });
 
   reader.on('open', () => {
+    if (reconnectAttempt > 0) {
+      console.log(`[evdev] Reconnected after ${reconnectAttempt} attempt(s)`);
+    }
+    reconnectAttempt = 0;
     deviceConnected = true;
     io.emit('nav:connected', { device: devicePath });
     console.log(`[evdev] Device connected: ${devicePath}`);
@@ -362,17 +373,25 @@ async function startEvdevReader(): Promise<void> {
   });
 
   reader.on('error', (err) => {
-    console.error(`[evdev] Error: ${err.message}`);
+    // Suppress repeated "Cannot open" noise — only log first attempt and every Nth
+    if (reconnectAttempt === 0 || reconnectAttempt % MAX_RECONNECT_LOG_INTERVAL === 0) {
+      console.error(`[evdev] Error: ${err.message}`);
+    }
   });
 
   reader.on('close', (reason) => {
     deviceConnected = false;
-    io.emit('nav:disconnected', { device: devicePath, reason });
-    console.log(`[evdev] Device closed: ${reason}`);
+    reconnectAttempt++;
 
-    // Auto-reconnect after 3 seconds — re-discovers the device path
-    console.log('[evdev] Reconnecting in 3s...');
-    setTimeout(() => startEvdevReader(), 3000);
+    if (reconnectAttempt === 1) {
+      io.emit('nav:disconnected', { device: devicePath, reason });
+      console.log(`[evdev] Device closed: ${reason}`);
+      console.log(`[evdev] Will keep retrying every ${RECONNECT_INTERVAL_MS / 1000}s...`);
+    } else if (reconnectAttempt % MAX_RECONNECT_LOG_INTERVAL === 0) {
+      console.log(`[evdev] Still waiting for controller... (attempt #${reconnectAttempt})`);
+    }
+
+    setTimeout(() => startEvdevReader(), RECONNECT_INTERVAL_MS);
   });
 
   reader.start();
